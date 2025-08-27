@@ -203,7 +203,7 @@ func sendDisconnect(w io.Writer, reason string) error {
 		return fmt.Errorf("pack disconnect: %w", err)
 	}
 
-	return WritePacket(0x00, pkt, w)
+	return WritePacket(0x1A, pkt, w)
 }
 
 type statusVersion struct {
