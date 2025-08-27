@@ -1,9 +1,3 @@
-# 我的世界加速ip
-
-## 如何運行
-1. [下載release](https://github.com/sduoduo233/go-mcproxy/releases/latest)
-2. 執行 `./mcproxy`
-
 ## 參數說明
 ```
 Usage of ./mcproxy:
