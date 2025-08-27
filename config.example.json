@@ -1,0 +1,40 @@
+{
+    "logging": {
+        "db_path": "./data/logs/mcproxy.db"
+    },
+    "proxies": [
+        {
+            "listen": "0.0.0.0:25565",
+            "description": "Proxy 1\nHypixel Server",
+            "remote": "mc.hypixel.net:25565",
+            "local_addr": "192.168.1.2:0",
+            "max_player": 20,
+            "ping_mode": "fake",
+            "fake_ping": 0,
+            "rewrite_host": "mc.hypixel.net",
+            "rewrite_port": 25565,
+            "auth": "none",
+            "whitelist": [
+                "L1quidBounce"
+            ],
+            "blacklist": []
+        },
+        {
+            "listen": "0.0.0.0:25566",
+            "description": "Proxy 2\nAnother Server",
+            "remote": "play.example.com:25565",
+            "local_addr": "",
+            "max_player": 50,
+            "ping_mode": "fake",
+            "fake_ping": 10,
+            "rewrite_host": "play.example.com",
+            "rewrite_port": 25565,
+            "auth": "whitelist",
+            "whitelist": [
+                "Player1",
+                "Player2"
+            ],
+            "blacklist": []
+        }
+    ]
+}
