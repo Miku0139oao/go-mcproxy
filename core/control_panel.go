@@ -1,6 +1,9 @@
 package core
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -22,14 +25,26 @@ type ProxyStats struct {
 	PublicIP        string
 }
 
+// Session represents a user session
+type Session struct {
+	ID        string
+	Username  string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
 // ControlPanel manages the web-based control panel
 type ControlPanel struct {
-	Stats           map[string]*ProxyStats
-	ConfigPath      string
-	CurrentConfig   *config.Config
+	Stats            map[string]*ProxyStats
+	ConfigPath       string
+	CurrentConfig    *config.Config
 	TotalConnections int32
 	ConnectionLimit  int
-	mutex           sync.RWMutex
+	mutex            sync.RWMutex
+	Username         string
+	Password         string
+	Sessions         map[string]*Session
+	SessionMutex     sync.RWMutex
 }
 
 var controlPanel *ControlPanel
@@ -39,10 +54,70 @@ var controlPanelOnce sync.Once
 func GetControlPanel() *ControlPanel {
 	controlPanelOnce.Do(func() {
 		controlPanel = &ControlPanel{
-			Stats: make(map[string]*ProxyStats),
+			Stats:    make(map[string]*ProxyStats),
+			Sessions: make(map[string]*Session),
 		}
 	})
 	return controlPanel
+}
+
+// generateSessionID generates a random session ID
+func generateSessionID() (string, error) {
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// CreateSession creates a new session for the given username
+func (cp *ControlPanel) CreateSession(username string) (*Session, error) {
+	sessionID, err := generateSessionID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate session ID: %w", err)
+	}
+
+	now := time.Now()
+	session := &Session{
+		ID:        sessionID,
+		Username:  username,
+		CreatedAt: now,
+		ExpiresAt: now.Add(24 * time.Hour), // Sessions expire after 24 hours
+	}
+
+	cp.SessionMutex.Lock()
+	cp.Sessions[sessionID] = session
+	cp.SessionMutex.Unlock()
+
+	return session, nil
+}
+
+// GetSession retrieves a session by ID
+func (cp *ControlPanel) GetSession(sessionID string) *Session {
+	cp.SessionMutex.RLock()
+	defer cp.SessionMutex.RUnlock()
+
+	session, exists := cp.Sessions[sessionID]
+	if !exists {
+		return nil
+	}
+
+	// Check if the session has expired
+	if time.Now().After(session.ExpiresAt) {
+		delete(cp.Sessions, sessionID)
+		return nil
+	}
+
+	return session
+}
+
+// RemoveSession removes a session by ID
+func (cp *ControlPanel) RemoveSession(sessionID string) {
+	cp.SessionMutex.Lock()
+	defer cp.SessionMutex.Unlock()
+
+	delete(cp.Sessions, sessionID)
 }
 
 // InitControlPanel initializes the control panel with the given configuration
@@ -54,6 +129,8 @@ func InitControlPanel(cfg *config.Config, configPath string) {
 	cp.ConfigPath = configPath
 	cp.CurrentConfig = cfg
 	cp.ConnectionLimit = MaxConnectionsPerIP
+	cp.Username = cfg.ControlPanel.Username
+	cp.Password = cfg.ControlPanel.Password
 
 	// Initialize stats for each proxy
 	for _, proxy := range cfg.Proxies {
@@ -150,19 +227,317 @@ func (cp *ControlPanel) ReloadConfig() error {
 	return nil
 }
 
+// sessionAuth is a middleware that checks for session authentication
+func sessionAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Check for session cookie
+		cookie, err := r.Cookie("session")
+		if err != nil {
+			// No session cookie, redirect to login page
+			http.Redirect(w, r, "/login?redirect="+r.URL.Path, http.StatusSeeOther)
+			return
+		}
+
+		// Get the session
+		cp := GetControlPanel()
+		session := cp.GetSession(cookie.Value)
+		if session == nil {
+			// Invalid or expired session, redirect to login page
+			http.Redirect(w, r, "/login?redirect="+r.URL.Path, http.StatusSeeOther)
+			return
+		}
+
+		// Authentication successful, call the next handler
+		next(w, r)
+	}
+}
+
+// handleLogin displays the login page
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	// Check if already logged in
+	cookie, err := r.Cookie("session")
+	if err == nil {
+		cp := GetControlPanel()
+		session := cp.GetSession(cookie.Value)
+		if session != nil {
+			// Already logged in, redirect to home
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
+	}
+
+	// Get the redirect URL from query parameter
+	redirect := r.URL.Query().Get("redirect")
+	if redirect == "" {
+		redirect = "/"
+	}
+
+	// Check if there's an error message
+	errorMsg := r.URL.Query().Get("error")
+
+	// Login page template
+	tmpl := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login - Minecraft Proxy Control Panel</title>
+    <link rel="icon" href="/favicon.png" type="image/png">
+    <style>
+        :root {
+            --primary-color: #3498db;
+            --primary-dark: #2980b9;
+            --secondary-color: #2ecc71;
+            --secondary-dark: #27ae60;
+            --danger-color: #e74c3c;
+            --danger-dark: #c0392b;
+            --text-color: #333;
+            --light-bg: #f8f9fa;
+            --border-color: #e0e0e0;
+            --shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: var(--light-bg);
+            color: var(--text-color);
+            line-height: 1.6;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .login-container {
+            max-width: 400px;
+            width: 100%;
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: var(--shadow);
+        }
+
+        h1 {
+            color: var(--primary-color);
+            margin-top: 0;
+            text-align: center;
+            border-bottom: 2px solid var(--primary-color);
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: var(--text-color);
+        }
+
+        input[type="text"], input[type="password"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+            box-sizing: border-box;
+        }
+
+        input[type="text"]:focus, input[type="password"]:focus {
+            border-color: var(--primary-color);
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+        }
+
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 12px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s;
+            width: 100%;
+        }
+
+        button:hover {
+            background-color: var(--primary-dark);
+        }
+
+        .error-message {
+            color: var(--danger-color);
+            background-color: rgba(231, 76, 60, 0.1);
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            display: {{if .ErrorMsg}}block{{else}}none{{end}};
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <h1>Minecraft Proxy Control Panel</h1>
+
+        <div class="error-message">{{.ErrorMsg}}</div>
+
+        <form action="/auth" method="post">
+            <input type="hidden" name="redirect" value="{{.Redirect}}">
+
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required autofocus>
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+
+            <button type="submit">Login</button>
+        </form>
+    </div>
+</body>
+</html>
+`
+
+	// Parse the template
+	t, err := template.New("login").Parse(tmpl)
+	if err != nil {
+		http.Error(w, "Template error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Execute the template
+	data := struct {
+		Redirect string
+		ErrorMsg string
+	}{
+		Redirect: redirect,
+		ErrorMsg: errorMsg,
+	}
+
+	err = t.Execute(w, data)
+	if err != nil {
+		http.Error(w, "Template execution error: "+err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// handleAuth handles the login form submission
+func handleAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse form
+	err := r.ParseForm()
+	if err != nil {
+		http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Get form values
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+	redirect := r.FormValue("redirect")
+	if redirect == "" {
+		redirect = "/"
+	}
+
+	// Validate credentials
+	cp := GetControlPanel()
+	cp.mutex.RLock()
+	validUsername := cp.Username
+	validPassword := cp.Password
+	cp.mutex.RUnlock()
+
+	if subtle.ConstantTimeCompare([]byte(username), []byte(validUsername)) != 1 ||
+		subtle.ConstantTimeCompare([]byte(password), []byte(validPassword)) != 1 {
+		// Invalid credentials, redirect back to login with error
+		http.Redirect(w, r, "/login?redirect="+redirect+"&error=Invalid+username+or+password", http.StatusSeeOther)
+		return
+	}
+
+	// Create a new session
+	session, err := cp.CreateSession(username)
+	if err != nil {
+		http.Error(w, "Failed to create session: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Set session cookie
+	cookie := &http.Cookie{
+		Name:     "session",
+		Value:    session.ID,
+		Path:     "/",
+		Expires:  session.ExpiresAt,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	}
+	http.SetCookie(w, cookie)
+
+	// Redirect to the requested page
+	http.Redirect(w, r, redirect, http.StatusSeeOther)
+}
+
+// handleLogout handles user logout
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Get the session cookie
+	cookie, err := r.Cookie("session")
+	if err == nil {
+		// Remove the session
+		cp := GetControlPanel()
+		cp.RemoveSession(cookie.Value)
+	}
+
+	// Clear the cookie
+	expiredCookie := &http.Cookie{
+		Name:     "session",
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(0, 0),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	}
+	http.SetCookie(w, expiredCookie)
+
+	// Redirect to login page
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// handleFavicon serves the favicon.png file
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	http.ServeFile(w, r, "favicon.png")
+}
+
 // StartControlPanel starts the HTTP server for the control panel
 func StartControlPanel(addr string) {
-	// Web UI routes
-	http.HandleFunc("/", handleIndex)
-	http.HandleFunc("/update", handleUpdate)
-	http.HandleFunc("/reload", handleReload)
+	// Serve favicon
+	http.HandleFunc("/favicon.png", handleFavicon)
 
-	// API routes for connection management
-	http.HandleFunc("/api/connections", handleAPIConnections)
-	http.HandleFunc("/api/disconnect", handleAPIDisconnect)
+	// Login routes (no authentication required)
+	http.HandleFunc("/login", handleLogin)
+	http.HandleFunc("/auth", handleAuth)
+	http.HandleFunc("/logout", handleLogout)
 
-	// API routes for logs
-	http.HandleFunc("/api/logs", handleAPILogs)
+	// Web UI routes with authentication
+	http.HandleFunc("/", sessionAuth(handleIndex))
+	http.HandleFunc("/update", sessionAuth(handleUpdate))
+	http.HandleFunc("/reload", sessionAuth(handleReload))
+
+	// API routes for connection management with authentication
+	http.HandleFunc("/api/connections", sessionAuth(handleAPIConnections))
+	http.HandleFunc("/api/disconnect", sessionAuth(handleAPIDisconnect))
+
+	// API routes for logs with authentication
+	http.HandleFunc("/api/logs", sessionAuth(handleAPILogs))
+	http.HandleFunc("/api/recent-logs", sessionAuth(handleAPIRecentLogs))
 
 	log.Printf("[INFO] Control panel listening on %s", addr)
 	go func() {
@@ -425,6 +800,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             <button class="tablinks" onclick="openTab(event, 'connections')">Active Connections</button>
             <button class="tablinks" onclick="openTab(event, 'logs')">Logs</button>
             <button class="tablinks" onclick="openTab(event, 'config')">Configuration</button>
+            <div style="margin-left: auto;">
+                <a href="/logout" style="display: inline-block; padding: 12px 20px; color: var(--danger-color); text-decoration: none; font-weight: 500;">Logout</a>
+            </div>
         </div>
 
         <div id="status" class="tabcontent active-tabcontent">
@@ -831,6 +1209,11 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                     document.getElementById('logs-prev-btn').disabled = logsCurrentPage === 0;
                     document.getElementById('logs-next-btn').disabled = 
                         (logsCurrentPage + 1) * logsPageSize >= logsTotalCount;
+
+                    // Update the lastLogTimestamp for real-time updates
+                    if (data.logs.length > 0 && logsCurrentPage === 0) {
+                        lastLogTimestamp = data.logs[0].timestamp;
+                    }
                 })
                 .catch(error => {
                     console.error('Error fetching logs:', error);
@@ -864,7 +1247,97 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             refreshLogs();
         }
 
-        // Auto-refresh logs every 30 seconds when the tab is active
+        // Variable to track the timestamp of the most recent log
+        let lastLogTimestamp = '';
+
+        // Function to fetch only new logs since the last fetch
+        function fetchRecentLogs() {
+            // Only fetch if we have a timestamp to start from
+            if (!lastLogTimestamp) {
+                refreshLogs(); // Do a full refresh the first time
+                return;
+            }
+
+            // Get filter values
+            const level = document.getElementById('log-level').value;
+
+            // Build the query URL
+            let url = '/api/recent-logs?limit=100';
+            if (level) url += '&level=' + encodeURIComponent(level);
+            if (lastLogTimestamp) url += '&since=' + encodeURIComponent(lastLogTimestamp);
+
+            fetch(url)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.logs.length === 0) {
+                        return; // No new logs
+                    }
+
+                    // Update the last timestamp for the next fetch
+                    if (data.logs.length > 0) {
+                        lastLogTimestamp = data.logs[0].timestamp;
+                    }
+
+                    // Get the current tbody
+                    const tbody = document.getElementById('logs-tbody');
+
+                    // If this is the first load or we're showing "No logs found", clear the tbody
+                    if (tbody.children.length === 1 && 
+                        tbody.children[0].innerHTML.includes('No logs found')) {
+                        tbody.innerHTML = '';
+                    }
+
+                    // Add new logs to the top of the table
+                    data.logs.reverse().forEach(log => {
+                        const row = document.createElement('tr');
+
+                        // Format the timestamp
+                        const timestamp = new Date(log.timestamp);
+                        const formattedTime = timestamp.toLocaleString();
+
+                        // Set row color based on log level
+                        let rowClass = '';
+                        if (log.level === 'ERROR' || log.level === 'FATAL') {
+                            rowClass = 'style="background-color: rgba(231, 76, 60, 0.1);"';
+                        } else if (log.level === 'WARN') {
+                            rowClass = 'style="background-color: rgba(243, 156, 18, 0.1);"';
+                        }
+
+                        row.innerHTML = 
+                            '<tr ' + rowClass + '>' +
+                            '<td>' + formattedTime + '</td>' +
+                            '<td>' + log.level + '</td>' +
+                            '<td>' + log.source + '</td>' +
+                            '<td>' + log.message + '</td>' +
+                            '</tr>';
+
+                        // Insert at the beginning of the table
+                        if (tbody.firstChild) {
+                            tbody.insertBefore(row, tbody.firstChild);
+                        } else {
+                            tbody.appendChild(row);
+                        }
+                    });
+
+                    // Limit the number of rows to 100 to prevent the table from growing too large
+                    while (tbody.children.length > 100) {
+                        tbody.removeChild(tbody.lastChild);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error fetching recent logs:', error);
+                });
+        }
+
+        // Auto-refresh logs every 5 seconds when the tab is active
+        setInterval(() => {
+            const logsTab = document.getElementById('logs');
+            if (logsTab.className.includes('active-tabcontent')) {
+                fetchRecentLogs();
+            }
+        }, 5000);
+
+        // Also do a full refresh every 30 seconds to ensure we have the latest data
         setInterval(() => {
             const logsTab = document.getElementById('logs');
             if (logsTab.className.includes('active-tabcontent')) {
@@ -1176,6 +1649,66 @@ func handleAPILogs(w http.ResponseWriter, r *http.Request) {
 		TotalCount: totalCount,
 		Limit:      limit,
 		Offset:     offset,
+	}
+
+	// Marshal to JSON
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		http.Error(w, "Failed to marshal logs: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Write the response
+	w.Write(jsonData)
+}
+
+// handleAPIRecentLogs returns a JSON list of the most recent logs
+func handleAPIRecentLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Set content type
+	w.Header().Set("Content-Type", "application/json")
+
+	// Parse query parameters for filtering
+	query := r.URL.Query()
+
+	// Parse limit
+	limit := 50 // Default limit
+	if limitStr := query.Get("limit"); limitStr != "" {
+		if parsedLimit, err := strconv.Atoi(limitStr); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+		}
+	}
+
+	// Parse level filter
+	level := query.Get("level")
+
+	// Parse since time
+	var since time.Time
+	if sinceStr := query.Get("since"); sinceStr != "" {
+		if parsed, err := time.Parse(time.RFC3339, sinceStr); err == nil {
+			since = parsed
+		}
+	}
+
+	// Get recent logs from the logger
+	l := logger.GetLogger()
+	logs, err := l.GetRecentLogs(limit, level, since)
+	if err != nil {
+		http.Error(w, "Failed to retrieve recent logs: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Create response with logs
+	response := struct {
+		Logs  []logger.LogEntry `json:"logs"`
+		Limit int               `json:"limit"`
+	}{
+		Logs:  logs,
+		Limit: limit,
 	}
 
 	// Marshal to JSON

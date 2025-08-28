@@ -2,6 +2,10 @@
     "logging": {
         "db_path": "./data/logs/mcproxy.db"
     },
+    "control_panel": {
+        "username": "admin",
+        "password": "change_this_password"
+    },
     "proxies": [
         {
             "listen": "0.0.0.0:25565",

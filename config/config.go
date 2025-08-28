@@ -11,6 +11,12 @@ type LogConfig struct {
 	DBPath string `json:"db_path"` // Path to the SQLite database file
 }
 
+// ControlPanelConfig contains configuration for the web control panel
+type ControlPanelConfig struct {
+	Username string `json:"username"` // Username for authentication
+	Password string `json:"password"` // Password for authentication
+}
+
 type ProxyConfig struct {
 	Listen      string   `json:"listen"`
 	Description string   `json:"description"`
@@ -29,8 +35,9 @@ type ProxyConfig struct {
 
 // Config represents the root configuration that can contain multiple proxy configurations
 type Config struct {
-	Proxies []ProxyConfig `json:"proxies"`
-	Logging LogConfig     `json:"logging"`
+	Proxies      []ProxyConfig      `json:"proxies"`
+	Logging      LogConfig          `json:"logging"`
+	ControlPanel ControlPanelConfig `json:"control_panel"`
 }
 
 // For backward compatibility
@@ -76,6 +83,17 @@ func ParseConfig(path string) *Config {
  		log.Printf("[INFO] Using default logging database path: %s", config.Logging.DBPath)
  	} else {
  		log.Printf("[INFO] Using configured logging database path: %s", config.Logging.DBPath)
+ 	}
+
+ 	// Set default control panel configuration if not provided
+ 	if config.ControlPanel.Username == "" {
+ 		config.ControlPanel.Username = "admin"
+ 		log.Printf("[INFO] Using default control panel username: %s", config.ControlPanel.Username)
+ 	}
+
+ 	if config.ControlPanel.Password == "" {
+ 		config.ControlPanel.Password = "admin"
+ 		log.Printf("[WARN] Using default control panel password. Please change it in the configuration file.")
  	}
 	}
 

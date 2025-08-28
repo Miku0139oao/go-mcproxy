@@ -161,6 +161,7 @@ func (l *Logger) Initialize(dbPath string) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+		CREATE INDEX IF NOT EXISTS idx_logs_level_timestamp ON logs(level, timestamp);
 	`)
 	if err != nil {
 		l.stdLogger.Printf("[ERROR] Failed to create logs table: %v", err)
@@ -181,6 +182,9 @@ func (l *Logger) Initialize(dbPath string) error {
 				message TEXT NOT NULL,
 				source TEXT NOT NULL
 			);
+			CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp);
+			CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+			CREATE INDEX IF NOT EXISTS idx_logs_level_timestamp ON logs(level, timestamp);
 		`)
 		if err != nil {
 			db.Close()
@@ -275,6 +279,12 @@ func (l *Logger) log(level LogLevel, calldepth int, format string, v ...interfac
 		// Check if we need to reinitialize the database connection
 		if isConnectionError(err) {
 			l.tryReconnect()
+		}
+	} else {
+		// Ensure the log is immediately written to disk
+		_, err = l.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+		if err != nil {
+			l.stdLogger.Printf("[WARN] Failed to checkpoint WAL: %v", err)
 		}
 	}
 }
@@ -418,6 +428,113 @@ func (l *Logger) GetLogs(limit, offset int, level string, startTime, endTime tim
 	if err != nil {
 		// All retries failed
 		l.stdLogger.Printf("[ERROR] Failed to query logs after %d attempts: %v", maxRetries, err)
+
+		// Check if we need to reinitialize the database connection
+		if isConnectionError(err) {
+			l.tryReconnect()
+		}
+
+		// Return empty logs instead of error to avoid breaking the UI
+		return []LogEntry{}, nil
+	}
+	defer rows.Close()
+
+	// Parse the results
+	logs := []LogEntry{}
+	for rows.Next() {
+		var entry LogEntry
+		var timestamp string
+		err := rows.Scan(&entry.ID, &timestamp, &entry.Level, &entry.Message, &entry.Source)
+		if err != nil {
+			l.stdLogger.Printf("[ERROR] Failed to scan log entry: %v", err)
+			continue // Skip this entry but continue processing others
+		}
+
+		// Parse the timestamp - try multiple formats
+		formats := []string{
+			time.RFC3339Nano,                    // ISO 8601 with nanoseconds (e.g., "2025-08-27T20:37:20.055403996Z")
+			"2006-01-02T15:04:05.999999999Z07:00", // ISO 8601 with nanoseconds and explicit timezone
+			"2006-01-02 15:04:05.999999999Z07:00", // Space separator with nanoseconds
+			"2006-01-02 15:04:05.999999999-07:00", // Original format
+		}
+
+		parsed := false
+		for _, format := range formats {
+			entry.Timestamp, err = time.Parse(format, timestamp)
+			if err == nil {
+				parsed = true
+				break
+			}
+		}
+
+		if !parsed {
+			l.stdLogger.Printf("[WARN] Failed to parse timestamp '%s' with any known format", timestamp)
+			entry.Timestamp = time.Now() // Fallback to current time if parsing fails
+		}
+
+		logs = append(logs, entry)
+	}
+
+	if err := rows.Err(); err != nil {
+		l.stdLogger.Printf("[ERROR] Error iterating log rows: %v", err)
+		// Continue anyway, return what we have
+	}
+
+	return logs, nil
+}
+
+// GetRecentLogs returns the most recent logs, optionally filtered by level
+func (l *Logger) GetRecentLogs(limit int, level string, since time.Time) ([]LogEntry, error) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	if !l.initialized || l.db == nil {
+		// Return empty logs instead of error to avoid breaking the UI
+		l.stdLogger.Printf("[WARN] GetRecentLogs called but logger not initialized")
+		return []LogEntry{}, nil
+	}
+
+	// Build the query
+	query := "SELECT id, timestamp, level, message, source FROM logs WHERE 1=1"
+	args := []interface{}{}
+
+	// Add filters
+	if level != "" {
+		query += " AND level = ?"
+		args = append(args, level)
+	}
+
+	if !since.IsZero() {
+		query += " AND timestamp > ?"
+		args = append(args, since.UTC())
+	}
+
+	// Add ordering and limits
+	query += " ORDER BY timestamp DESC LIMIT ?"
+	args = append(args, limit)
+
+	// Execute the query with retry logic
+	var rows *sql.Rows
+	var err error
+	maxRetries := 3
+
+	for i := 0; i < maxRetries; i++ {
+		rows, err = l.db.Query(query, args...)
+		if err == nil {
+			break
+		}
+
+		// If this is not the last retry, wait a bit before trying again
+		if i < maxRetries-1 {
+			l.stdLogger.Printf("[WARN] Failed to query recent logs (attempt %d/%d): %v", 
+				i+1, maxRetries, err)
+			time.Sleep(time.Duration(50*(i+1)) * time.Millisecond)
+		}
+	}
+
+	if err != nil {
+		// All retries failed
+		l.stdLogger.Printf("[ERROR] Failed to query recent logs after %d attempts: %v", maxRetries, err)
 
 		// Check if we need to reinitialize the database connection
 		if isConnectionError(err) {
