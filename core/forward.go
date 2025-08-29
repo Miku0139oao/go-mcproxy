@@ -167,16 +167,84 @@ func handleForward(reader io.Reader, writer io.Writer, fml bool, protocol int, c
 
 	// Forward data from remote server to client with buffering
 	go func() {
-		// Create a buffered reader for better performance
-		bufferedRemote := bufio.NewReaderSize(remote, bufferSize)
-
 		// Use a buffer for copying
 		buffer := make([]byte, bufferSize)
 
 		// Manual copy loop with buffering for better performance
 		var bytesWritten int64
+		var remoteConn net.Conn = remote
+		var bufferedRemote *bufio.Reader = bufio.NewReaderSize(remote, bufferSize)
+
 		for {
+			// Read from the remote server
 			nr, er := bufferedRemote.Read(buffer)
+
+			// If read failed with an error other than EOF, try to reconnect
+			if er != nil && er != io.EOF {
+				log.Printf("[WARN] Read error from server for %s, attempting to reconnect: %v", username, er)
+
+				// Close the old connection
+				remoteConn.Close()
+
+				// Reconnect using DialMC to re-resolve DNS
+				newConn, dialErr := DialMC(cfg.Remote, cfg.LocalAddr)
+				if dialErr != nil {
+					log.Printf("[ERROR] Failed to reconnect to remote server %s: %v", cfg.Remote, dialErr)
+					break
+				}
+
+				log.Printf("[INFO] Successfully reconnected to remote server %s for user %s", cfg.Remote, username)
+				remoteConn = newConn
+				bufferedRemote = bufio.NewReaderSize(newConn, bufferSize)
+
+				// Update the connection in the connection object
+				if connection != nil {
+					connection.RemoteConn = newConn
+				}
+
+				// Need to resend handshake and login packets after reconnection
+				if !isBungeeServerSwitch {
+					// Resend handshake packet
+					rewriteHost := cfg.RewirteHost
+					if fml {
+						rewriteHost += "\x00FML\x00"
+					}
+
+					pktHandshake, err := Pack(
+						VarInt(protocol),
+						String(rewriteHost),
+						UShort(cfg.RewirtePort),
+						VarInt(2), // next state login
+					)
+					if err != nil {
+						log.Printf("[ERROR] Failed to create handshake packet for reconnection: %v", err)
+						break
+					}
+
+					err = WritePacket(0x00, pktHandshake, newConn)
+					if err != nil {
+						log.Printf("[ERROR] Failed to send handshake packet for reconnection: %v", err)
+						break
+					}
+
+					// Resend login start packet
+					pktLoginStart, err := Pack(String(username))
+					if err != nil {
+						log.Printf("[ERROR] Failed to create login start packet for reconnection: %v", err)
+						break
+					}
+
+					err = WritePacket(0x00, pktLoginStart, newConn)
+					if err != nil {
+						log.Printf("[ERROR] Failed to send login start packet for reconnection: %v", err)
+						break
+					}
+				}
+
+				// Try reading again with the new connection
+				continue
+			}
+
 			if nr > 0 {
 				nw, ew := writer.Write(buffer[0:nr])
 				if nw < 0 || nr < nw {
@@ -195,12 +263,16 @@ func handleForward(reader io.Reader, writer io.Writer, fml bool, protocol int, c
 					break
 				}
 			}
+
 			if er != nil {
-				if er != io.EOF {
-					log.Printf("[ERROR] Read error forwarding data from server to client for %s: %v", username, er)
-				}
+				// We already handled non-EOF errors above
 				break
 			}
+		}
+
+		// Make sure to close the current remote connection if it's different from the original
+		if remoteConn != remote {
+			remoteConn.Close()
 		}
 
 		log.Printf("[DEBUG] Forwarded %d bytes from server to client for %s", bytesWritten, username)
@@ -222,19 +294,54 @@ func handleForward(reader io.Reader, writer io.Writer, fml bool, protocol int, c
 
 		// Manual copy loop with buffering for better performance
 		var bytesWritten int64
+		var remoteConn net.Conn = remote
+
 		for {
 			nr, er := bufferedReader.Read(buffer)
 			if nr > 0 {
-				nw, ew := remote.Write(buffer[0:nr])
+				// Try to write to the remote server
+				var writeErr error
+				var nw int
+
+				// Attempt to write to the current connection
+				nw, writeErr = remoteConn.Write(buffer[0:nr])
+
+				// If write failed, try to reconnect using DialMC to re-resolve DNS
+				if writeErr != nil {
+					log.Printf("[WARN] Write error to server for %s, attempting to reconnect: %v", username, writeErr)
+
+					// Close the old connection
+					remoteConn.Close()
+
+					// Reconnect using DialMC to re-resolve DNS
+					newConn, dialErr := DialMC(cfg.Remote, cfg.LocalAddr)
+					if dialErr != nil {
+						log.Printf("[ERROR] Failed to reconnect to remote server %s: %v", cfg.Remote, dialErr)
+						break
+					}
+
+					log.Printf("[INFO] Successfully reconnected to remote server %s for user %s", cfg.Remote, username)
+					remoteConn = newConn
+
+					// Update the connection in the connection object
+					if connection != nil {
+						connection.RemoteConn = newConn
+					}
+
+					// Try writing again with the new connection
+					nw, writeErr = remoteConn.Write(buffer[0:nr])
+				}
+
 				if nw < 0 || nr < nw {
 					nw = 0
-					if ew == nil {
-						ew = fmt.Errorf("invalid write result")
+					if writeErr == nil {
+						writeErr = fmt.Errorf("invalid write result")
 					}
 				}
+
 				bytesWritten += int64(nw)
-				if ew != nil {
-					log.Printf("[ERROR] Write error forwarding data from client to server for %s: %v", username, ew)
+				if writeErr != nil {
+					log.Printf("[ERROR] Write error forwarding data from client to server for %s: %v", username, writeErr)
 					break
 				}
 				if nr != nw {
@@ -242,12 +349,18 @@ func handleForward(reader io.Reader, writer io.Writer, fml bool, protocol int, c
 					break
 				}
 			}
+
 			if er != nil {
 				if er != io.EOF {
 					log.Printf("[ERROR] Read error forwarding data from client to server for %s: %v", username, er)
 				}
 				break
 			}
+		}
+
+		// Make sure to close the current remote connection
+		if remoteConn != remote {
+			remoteConn.Close()
 		}
 
 		log.Printf("[DEBUG] Forwarded %d bytes from client to server for %s", bytesWritten, username)

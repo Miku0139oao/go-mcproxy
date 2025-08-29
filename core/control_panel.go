@@ -538,6 +538,7 @@ func StartControlPanel(addr string) {
 	// API routes for logs with authentication
 	http.HandleFunc("/api/logs", sessionAuth(handleAPILogs))
 	http.HandleFunc("/api/recent-logs", sessionAuth(handleAPIRecentLogs))
+	http.HandleFunc("/api/delete-logs", sessionAuth(handleAPIDeleteLogs))
 
 	log.Printf("[INFO] Control panel listening on %s", addr)
 	go func() {
@@ -747,6 +748,22 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             background-color: var(--primary-dark);
         }
 
+        .danger-btn {
+            background-color: var(--danger-color);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background-color 0.3s;
+            margin-left: 10px;
+        }
+
+        .danger-btn:hover {
+            background-color: var(--danger-dark);
+        }
+
         .card {
             background-color: white;
             border-radius: 8px;
@@ -938,16 +955,21 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                 <div id="logs-pagination" style="margin-top: 20px; display: flex; justify-content: space-between; align-items: center;">
                     <div>
                         <span>Showing <span id="logs-showing">0</span> of <span id="logs-total">0</span> logs</span>
+                        <span style="margin-left: 10px; font-style: italic; color: #666;">Page <span id="current-page">1</span> of <span id="total-pages">1</span></span>
                     </div>
                     <div>
+                        <button onclick="goToFirstPage()" class="refresh-btn" id="logs-first-btn" disabled>First</button>
                         <button onclick="previousLogsPage()" class="refresh-btn" id="logs-prev-btn" disabled>Previous</button>
                         <button onclick="nextLogsPage()" class="refresh-btn" id="logs-next-btn" disabled>Next</button>
+                        <button onclick="goToLastPage()" class="refresh-btn" id="logs-last-btn" disabled>Last</button>
                     </div>
                 </div>
 
                 <div class="action-buttons">
                     <button onclick="refreshLogs()" class="refresh-btn">Refresh Logs</button>
                     <button onclick="clearLogFilters()" class="refresh-btn">Clear Filters</button>
+                    <button onclick="deleteFilteredLogs()" class="danger-btn">Delete Filtered Logs</button>
+                    <button onclick="deleteAllLogs()" class="danger-btn">Delete All Logs</button>
                 </div>
             </div>
         </div>
@@ -1198,6 +1220,9 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                         });
                     }
 
+                    // Calculate total pages
+                    const totalPages = Math.ceil(logsTotalCount / logsPageSize) || 1;
+
                     // Update pagination info
                     document.getElementById('logs-showing').textContent = 
                         data.logs.length > 0 ? 
@@ -1205,9 +1230,16 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                         Math.min((logsCurrentPage + 1) * logsPageSize, logsTotalCount) : 0;
                     document.getElementById('logs-total').textContent = logsTotalCount;
 
+                    // Update page numbers
+                    document.getElementById('current-page').textContent = logsCurrentPage + 1;
+                    document.getElementById('total-pages').textContent = totalPages;
+
                     // Update pagination buttons
+                    document.getElementById('logs-first-btn').disabled = logsCurrentPage === 0;
                     document.getElementById('logs-prev-btn').disabled = logsCurrentPage === 0;
                     document.getElementById('logs-next-btn').disabled = 
+                        (logsCurrentPage + 1) * logsPageSize >= logsTotalCount;
+                    document.getElementById('logs-last-btn').disabled = 
                         (logsCurrentPage + 1) * logsPageSize >= logsTotalCount;
 
                     // Update the lastLogTimestamp for real-time updates
@@ -1220,6 +1252,12 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                     const tbody = document.getElementById('logs-tbody');
                     tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: red;">Error loading logs</td></tr>';
                 });
+        }
+
+        // Function to go to the first page of logs
+        function goToFirstPage() {
+            logsCurrentPage = 0;
+            refreshLogs();
         }
 
         // Function to go to the previous page of logs
@@ -1238,6 +1276,13 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             }
         }
 
+        // Function to go to the last page of logs
+        function goToLastPage() {
+            logsCurrentPage = Math.ceil(logsTotalCount / logsPageSize) - 1;
+            if (logsCurrentPage < 0) logsCurrentPage = 0;
+            refreshLogs();
+        }
+
         // Function to clear log filters
         function clearLogFilters() {
             document.getElementById('log-level').value = '';
@@ -1245,6 +1290,78 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             document.getElementById('log-end-time').value = '';
             logsCurrentPage = 0;
             refreshLogs();
+        }
+
+        // Function to delete logs based on current filters
+        function deleteFilteredLogs() {
+            if (!confirm('Are you sure you want to delete all logs matching the current filters? This action cannot be undone.')) {
+                return;
+            }
+
+            // Get filter values
+            const level = document.getElementById('log-level').value;
+            const startTime = document.getElementById('log-start-time').value ? 
+                new Date(document.getElementById('log-start-time').value).toISOString() : '';
+            const endTime = document.getElementById('log-end-time').value ? 
+                new Date(document.getElementById('log-end-time').value).toISOString() : '';
+
+            // Prepare request data
+            const requestData = {
+                level: level,
+                start_time: startTime,
+                end_time: endTime
+            };
+
+            // Send delete request
+            fetch('/api/delete-logs', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(requestData)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('Successfully deleted ' + data.rows_affected + ' log entries.');
+                    refreshLogs(); // Refresh the logs display
+                } else {
+                    alert('Failed to delete logs: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                console.error('Error deleting logs:', error);
+                alert('Error deleting logs: ' + error.message);
+            });
+        }
+
+        // Function to delete all logs
+        function deleteAllLogs() {
+            if (!confirm('Are you sure you want to delete ALL logs? This action cannot be undone.')) {
+                return;
+            }
+
+            // Send delete request with no filters to delete all logs
+            fetch('/api/delete-logs', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('Successfully deleted ' + data.rows_affected + ' log entries.');
+                    refreshLogs(); // Refresh the logs display
+                } else {
+                    alert('Failed to delete logs: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                console.error('Error deleting logs:', error);
+                alert('Error deleting logs: ' + error.message);
+            });
         }
 
         // Variable to track the timestamp of the most recent log
@@ -1715,6 +1832,88 @@ func handleAPIRecentLogs(w http.ResponseWriter, r *http.Request) {
 	jsonData, err := json.Marshal(response)
 	if err != nil {
 		http.Error(w, "Failed to marshal logs: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Write the response
+	w.Write(jsonData)
+}
+
+// handleAPIDeleteLogs handles the deletion of logs based on filters or IDs
+func handleAPIDeleteLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Set content type
+	w.Header().Set("Content-Type", "application/json")
+
+	// Parse the request body
+	var requestData struct {
+		IDs       []int64  `json:"ids"`
+		Level     string   `json:"level"`
+		StartTime string   `json:"start_time"`
+		EndTime   string   `json:"end_time"`
+	}
+
+	err := json.NewDecoder(r.Body).Decode(&requestData)
+	if err != nil {
+		http.Error(w, "Failed to parse request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Get the logger
+	l := logger.GetLogger()
+
+	var rowsAffected int64
+
+	// If IDs are provided, delete logs by ID
+	if len(requestData.IDs) > 0 {
+		rowsAffected, err = l.DeleteLogsByID(requestData.IDs)
+		if err != nil {
+			http.Error(w, "Failed to delete logs by ID: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// Otherwise, delete logs by filter criteria
+		var startTime, endTime time.Time
+		if requestData.StartTime != "" {
+			startTime, err = time.Parse(time.RFC3339, requestData.StartTime)
+			if err != nil {
+				http.Error(w, "Invalid start time format: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+
+		if requestData.EndTime != "" {
+			endTime, err = time.Parse(time.RFC3339, requestData.EndTime)
+			if err != nil {
+				http.Error(w, "Invalid end time format: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+
+		rowsAffected, err = l.DeleteLogs(requestData.Level, startTime, endTime)
+		if err != nil {
+			http.Error(w, "Failed to delete logs: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Create response with deletion info
+	response := struct {
+		Success      bool  `json:"success"`
+		RowsAffected int64 `json:"rows_affected"`
+	}{
+		Success:      true,
+		RowsAffected: rowsAffected,
+	}
+
+	// Marshal to JSON
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		http.Error(w, "Failed to marshal response: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 

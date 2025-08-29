@@ -655,3 +655,140 @@ func (l *Logger) GetLogCount(level string, startTime, endTime time.Time) (int, e
 
 	return count, nil
 }
+
+// DeleteLogs deletes logs matching the given filters
+func (l *Logger) DeleteLogs(level string, startTime, endTime time.Time) (int64, error) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	if !l.initialized || l.db == nil {
+		l.stdLogger.Printf("[WARN] DeleteLogs called but logger not initialized")
+		return 0, fmt.Errorf("logger not initialized")
+	}
+
+	// Build the query
+	query := "DELETE FROM logs WHERE 1=1"
+	args := []interface{}{}
+
+	// Add filters
+	if level != "" {
+		query += " AND level = ?"
+		args = append(args, level)
+	}
+
+	if !startTime.IsZero() {
+		query += " AND timestamp >= ?"
+		args = append(args, startTime.UTC())
+	}
+
+	if !endTime.IsZero() {
+		query += " AND timestamp <= ?"
+		args = append(args, endTime.UTC())
+	}
+
+	// Execute the query with retry logic
+	var result sql.Result
+	var err error
+	maxRetries := 3
+
+	for i := 0; i < maxRetries; i++ {
+		result, err = l.db.Exec(query, args...)
+		if err == nil {
+			break
+		}
+
+		// If this is not the last retry, wait a bit before trying again
+		if i < maxRetries-1 {
+			l.stdLogger.Printf("[WARN] Failed to delete logs (attempt %d/%d): %v", 
+				i+1, maxRetries, err)
+			time.Sleep(time.Duration(50*(i+1)) * time.Millisecond)
+		}
+	}
+
+	if err != nil {
+		// All retries failed
+		l.stdLogger.Printf("[ERROR] Failed to delete logs after %d attempts: %v", maxRetries, err)
+
+		// Check if we need to reinitialize the database connection
+		if isConnectionError(err) {
+			l.tryReconnect()
+		}
+
+		return 0, err
+	}
+
+	// Get the number of rows affected
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		l.stdLogger.Printf("[WARN] Failed to get rows affected: %v", err)
+		return 0, err
+	}
+
+	l.stdLogger.Printf("[INFO] Deleted %d log entries", rowsAffected)
+	return rowsAffected, nil
+}
+
+// DeleteLogsByID deletes logs with the specified IDs
+func (l *Logger) DeleteLogsByID(ids []int64) (int64, error) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	if !l.initialized || l.db == nil {
+		l.stdLogger.Printf("[WARN] DeleteLogsByID called but logger not initialized")
+		return 0, fmt.Errorf("logger not initialized")
+	}
+
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	// Build the query with placeholders for each ID
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := fmt.Sprintf("DELETE FROM logs WHERE id IN (%s)", strings.Join(placeholders, ","))
+
+	// Execute the query with retry logic
+	var result sql.Result
+	var err error
+	maxRetries := 3
+
+	for i := 0; i < maxRetries; i++ {
+		result, err = l.db.Exec(query, args...)
+		if err == nil {
+			break
+		}
+
+		// If this is not the last retry, wait a bit before trying again
+		if i < maxRetries-1 {
+			l.stdLogger.Printf("[WARN] Failed to delete logs by ID (attempt %d/%d): %v", 
+				i+1, maxRetries, err)
+			time.Sleep(time.Duration(50*(i+1)) * time.Millisecond)
+		}
+	}
+
+	if err != nil {
+		// All retries failed
+		l.stdLogger.Printf("[ERROR] Failed to delete logs by ID after %d attempts: %v", maxRetries, err)
+
+		// Check if we need to reinitialize the database connection
+		if isConnectionError(err) {
+			l.tryReconnect()
+		}
+
+		return 0, err
+	}
+
+	// Get the number of rows affected
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		l.stdLogger.Printf("[WARN] Failed to get rows affected: %v", err)
+		return 0, err
+	}
+
+	l.stdLogger.Printf("[INFO] Deleted %d log entries by ID", rowsAffected)
+	return rowsAffected, nil
+}
