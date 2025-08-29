@@ -70,13 +70,20 @@ func RegisterConnection(conn *Connection) {
 
 // UnregisterConnection removes a connection from the tracking system
 func UnregisterConnection(id string) {
+	// Get the connection first before removing it
 	activeConnections.Lock()
 	conn := activeConnections.connections[id]
 	delete(activeConnections.connections, id)
 	activeConnections.Unlock()
 
+	// If connection is nil, there's nothing more to do
+	if conn == nil {
+		log.Printf("[WARN] Attempted to unregister non-existent connection with ID: %s", id)
+		return
+	}
+
 	// Decrement connection count for this IP
-	if conn != nil && conn.PublicIP != "" && conn.PublicIP != "N/A" && conn.PublicIP != "Error" && conn.PublicIP != "Unknown" {
+	if conn.PublicIP != "" && conn.PublicIP != "N/A" && conn.PublicIP != "Error" && conn.PublicIP != "Unknown" {
 		connectionsPerIP.Lock()
 		if connectionsPerIP.counts[conn.PublicIP] > 0 {
 			connectionsPerIP.counts[conn.PublicIP]--
@@ -139,48 +146,96 @@ func GetAllConnections() []*Connection {
 
 // DisconnectClient forcibly disconnects a client by ID
 func DisconnectClient(id string, reason string) error {
-	conn := GetConnection(id)
+	// Get the connection with a read lock first to check if it exists
+	activeConnections.RLock()
+	conn := activeConnections.connections[id]
+	activeConnections.RUnlock()
+
 	if conn == nil {
+		log.Printf("[WARN] Attempted to disconnect non-existent connection with ID: %s", id)
 		return fmt.Errorf("connection not found")
 	}
 
-	log.Printf("[INFO] Disconnecting client %s (%s) with reason: %s", conn.Username, conn.ClientAddr, reason)
+	// Store username and client address for logging
+	username := conn.Username
+	clientAddr := conn.ClientAddr
+	proxyAddr := conn.ProxyAddr
+
+	log.Printf("[INFO] Disconnecting client %s (%s) with reason: %s", username, clientAddr, reason)
+
+	// Create local copies of the connections to avoid race conditions
+	var clientConn, remoteConn net.Conn
+
+	// Lock again to safely get the latest connection state
+	activeConnections.RLock()
+	if conn.ClientConn != nil {
+		clientConn = conn.ClientConn
+	}
+	if conn.RemoteConn != nil {
+		remoteConn = conn.RemoteConn
+	}
+	activeConnections.RUnlock()
 
 	// Send disconnect message if possible
-	if conn.ClientConn != nil {
-		err := sendDisconnect(conn.ClientConn, reason)
+	if clientConn != nil {
+		// Set a write deadline to avoid blocking indefinitely
+		if setter, ok := clientConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			err := setter.SetWriteDeadline(time.Now().Add(1 * time.Second))
+			if err != nil {
+				log.Printf("[WARN] Failed to set write deadline for %s: %v", username, err)
+			}
+		}
+
+		err := sendDisconnect(clientConn, reason)
 		if err != nil {
 			// Just log the error, we'll still try to close the connection
-			log.Printf("[WARN] Failed to send disconnect message to %s: %v", conn.Username, err)
-		}
+			log.Printf("[WARN] Failed to send disconnect message to %s: %v", username, err)
+		} else {
+			log.Printf("[DEBUG] Successfully sent disconnect message to %s", username)
 
-		// Ensure we flush any buffered data
-		if flusher, ok := conn.ClientConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-			flusher.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			// Ensure we flush any buffered data
+			if flusher, ok := clientConn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				err := flusher.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				if err != nil {
+					log.Printf("[WARN] Failed to set flush deadline for %s: %v", username, err)
+				}
+			}
+
+			// Close connections with a small delay to ensure disconnect message is sent
+			time.Sleep(200 * time.Millisecond)
+		}
+	} else {
+		log.Printf("[WARN] No client connection available for %s, skipping disconnect message", username)
+	}
+
+	// Close the client connection
+	if clientConn != nil {
+		err := clientConn.Close()
+		if err != nil {
+			log.Printf("[WARN] Error closing client connection for %s: %v", username, err)
+		} else {
+			log.Printf("[DEBUG] Closed client connection for %s", username)
 		}
 	}
 
-	// Close connections with a small delay to ensure disconnect message is sent
-	time.Sleep(200 * time.Millisecond)
-
-	if conn.ClientConn != nil {
-		conn.ClientConn.Close()
-		log.Printf("[DEBUG] Closed client connection for %s", conn.Username)
-	}
-
-	if conn.RemoteConn != nil {
-		conn.RemoteConn.Close()
-		log.Printf("[DEBUG] Closed remote connection for %s", conn.Username)
+	// Close the remote connection
+	if remoteConn != nil {
+		err := remoteConn.Close()
+		if err != nil {
+			log.Printf("[WARN] Error closing remote connection for %s: %v", username, err)
+		} else {
+			log.Printf("[DEBUG] Closed remote connection for %s", username)
+		}
 	}
 
 	// Decrement connection counters
 	onlineCount.Add(-1)
 	cp := GetControlPanel()
-	cp.DecrementConnectionCount(conn.ProxyAddr)
+	cp.DecrementConnectionCount(proxyAddr)
 
 	// Unregister the connection
 	UnregisterConnection(id)
-	log.Printf("[INFO] Successfully disconnected client %s", conn.Username)
+	log.Printf("[INFO] Successfully disconnected client %s", username)
 
 	return nil
 }

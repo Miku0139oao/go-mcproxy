@@ -62,29 +62,41 @@ func WritePacket(pktID int, pkt []byte, w io.Writer) error {
 	buf := new(bytes.Buffer)
 
 	// length = packet id length + packet length
-	len := VarInt(pktID).Len() + len(pkt)
+	pktLength := VarInt(pktID).Len() + len(pkt)
 
 	// write packet length
-	_, err := VarInt(len).WriteTo(buf)
+	_, err := VarInt(pktLength).WriteTo(buf)
 	if err != nil {
-		return err
+		return fmt.Errorf("write packet length: %w", err)
 	}
 
 	// write packet id
 	_, err = VarInt(pktID).WriteTo(buf)
 	if err != nil {
-		return err
+		return fmt.Errorf("write packet id: %w", err)
 	}
 
 	// write packet
 	_, err = buf.Write(pkt)
 	if err != nil {
-		return err
+		return fmt.Errorf("write packet to buffer: %w", err)
 	}
 
-	// write
-	_, err = w.Write(buf.Bytes())
-	return err
+	// Get the complete packet data
+	packetData := buf.Bytes()
+
+	// write to the connection
+	n, err := w.Write(packetData)
+	if err != nil {
+		return fmt.Errorf("write packet to connection: %w", err)
+	}
+
+	// Check if we wrote the complete packet
+	if n < len(packetData) {
+		return fmt.Errorf("short write: wrote %d of %d bytes", n, len(packetData))
+	}
+
+	return nil
 }
 
 func (p *Packet) Scan(r ...io.ReaderFrom) (int64, error) {

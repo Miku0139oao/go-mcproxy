@@ -1127,21 +1127,57 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
         // Function to disconnect a client
         function disconnectClient(id) {
+            if (!id) {
+                console.error('Attempted to disconnect client with empty ID');
+                alert('Error: Connection ID is missing');
+                return;
+            }
+
             if (!confirm('Are you sure you want to disconnect this client?')) {
                 return;
             }
 
-            const formData = new FormData();
-            formData.append('id', id);
-            formData.append('reason', 'Disconnected by administrator');
+            const requestData = {
+                id: id,
+                reason: 'Disconnected by administrator'
+            };
 
             fetch('/api/disconnect', {
                 method: 'POST',
-                body: formData
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(requestData)
             })
-            .then(response => response.json())
+            .then(async response => {
+                if (!response.ok) {
+                    // Try to get the error message from the response body
+                    let errorMessage = '';
+                    try {
+                        // Clone the response to avoid consuming it
+                        const clonedResponse = response.clone();
+                        // Try to read the response as text
+                        const text = await clonedResponse.text();
+                        if (text) {
+                            errorMessage = ': ' + text;
+                        } else if (response.statusText) {
+                            errorMessage = ': ' + response.statusText;
+                        }
+                    } catch (e) {
+                        // If we can't read the response, just use the status text if available
+                        if (response.statusText) {
+                            errorMessage = ': ' + response.statusText;
+                        }
+                    }
+                    throw new Error('HTTP error ' + response.status + errorMessage);
+                }
+                return response.json();
+            })
             .then(result => {
                 if (result.success) {
+                    if (result.message) {
+                        console.log(result.message);
+                    }
                     refreshConnections();
                 } else {
                     alert('Failed to disconnect client');
@@ -1149,7 +1185,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
             })
             .catch(error => {
                 console.error('Error disconnecting client:', error);
-                alert('Error disconnecting client');
+                alert('Error disconnecting client: ' + error.message);
             });
         }
 
@@ -1657,26 +1693,54 @@ func handleAPIConnections(w http.ResponseWriter, r *http.Request) {
 // handleAPIDisconnect disconnects a specific client
 func handleAPIDisconnect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		// Set content type for error response
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		// Write a clear error message
+		fmt.Fprint(w, "Method not allowed. Only POST requests are accepted.")
 		return
 	}
 
-	// Parse form data
-	err := r.ParseForm()
+	// Parse JSON data
+	var requestData struct {
+		ID     string `json:"id"`
+		Reason string `json:"reason"`
+	}
+
+	err := json.NewDecoder(r.Body).Decode(&requestData)
 	if err != nil {
-		http.Error(w, "Failed to parse form: "+err.Error(), http.StatusBadRequest)
+		// Set content type for error response
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		// Write a detailed error message
+		fmt.Fprintf(w, "Failed to parse JSON: %s", err.Error())
 		return
 	}
 
 	// Get connection ID
-	id := r.FormValue("id")
+	id := requestData.ID
 	if id == "" {
-		http.Error(w, "Connection ID is required", http.StatusBadRequest)
+		log.Printf("[ERROR] Disconnect attempt with empty connection ID")
+		// Set content type for error response
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		// Write a clear error message
+		fmt.Fprint(w, "Connection ID is required")
+		return
+	}
+
+	// Check if the connection exists before trying to disconnect it
+	conn := GetConnection(id)
+	if conn == nil {
+		log.Printf("[WARN] Attempted to disconnect non-existent connection with ID: %s", id)
+		// Return success even if the connection doesn't exist, as it's already disconnected
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"success": true, "message": "Connection already disconnected"}`))
 		return
 	}
 
 	// Get disconnect reason
-	reason := r.FormValue("reason")
+	reason := requestData.Reason
 	if reason == "" {
 		reason = "Disconnected by administrator"
 	}
@@ -1684,7 +1748,11 @@ func handleAPIDisconnect(w http.ResponseWriter, r *http.Request) {
 	// Disconnect the client
 	err = DisconnectClient(id, reason)
 	if err != nil {
-		http.Error(w, "Failed to disconnect client: "+err.Error(), http.StatusInternalServerError)
+		// Set content type for error response
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		// Write a detailed error message
+		fmt.Fprintf(w, "Failed to disconnect client: %s", err.Error())
 		return
 	}
 

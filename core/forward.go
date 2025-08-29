@@ -197,9 +197,19 @@ func handleForward(reader io.Reader, writer io.Writer, fml bool, protocol int, c
 				remoteConn = newConn
 				bufferedRemote = bufio.NewReaderSize(newConn, bufferSize)
 
-				// Update the connection in the connection object
+				// Update the connection in the connection object with proper synchronization
 				if connection != nil {
-					connection.RemoteConn = newConn
+					// Lock the connections map to safely update the connection
+					activeConnections.Lock()
+					// Get the latest version of the connection from the map
+					updatedConn := activeConnections.connections[connection.ID]
+					if updatedConn != nil {
+						updatedConn.RemoteConn = newConn
+						log.Printf("[DEBUG] Updated remote connection for user %s", username)
+					} else {
+						log.Printf("[WARN] Connection %s no longer exists in active connections map", connection.ID)
+					}
+					activeConnections.Unlock()
 				}
 
 				// Need to resend handshake and login packets after reconnection
@@ -323,9 +333,19 @@ func handleForward(reader io.Reader, writer io.Writer, fml bool, protocol int, c
 					log.Printf("[INFO] Successfully reconnected to remote server %s for user %s", cfg.Remote, username)
 					remoteConn = newConn
 
-					// Update the connection in the connection object
+					// Update the connection in the connection object with proper synchronization
 					if connection != nil {
-						connection.RemoteConn = newConn
+						// Lock the connections map to safely update the connection
+						activeConnections.Lock()
+						// Get the latest version of the connection from the map
+						updatedConn := activeConnections.connections[connection.ID]
+						if updatedConn != nil {
+							updatedConn.RemoteConn = newConn
+							log.Printf("[DEBUG] Updated remote connection for user %s", username)
+						} else {
+							log.Printf("[WARN] Connection %s no longer exists in active connections map", connection.ID)
+						}
+						activeConnections.Unlock()
 					}
 
 					// Try writing again with the new connection
