@@ -227,7 +227,7 @@ func (pb *ProxyBalancer) handleConnection(clientConn net.Conn) {
 
 		// Increment global connection count
 		onlineCount.Add(1)
-		defer onlineCount.Add(-1)
+ 	defer decrementOnlineCount()
 
 		// Only increment connection count for the load balancer itself
 		// The individual proxy's connection count will be incremented in handleForward

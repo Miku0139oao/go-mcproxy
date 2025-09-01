@@ -19,6 +19,19 @@ const VERSION_1_18_2 = 758
 
 var onlineCount atomic.Int32
 
+// decrementOnlineCount safely decrements onlineCount without allowing negative values
+func decrementOnlineCount() {
+	for {
+		cur := onlineCount.Load()
+		if cur <= 0 {
+			return
+		}
+		if onlineCount.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
 // Connection represents an active client connection
 type Connection struct {
 	ID          string    // Unique identifier for the connection
@@ -229,7 +242,7 @@ func DisconnectClient(id string, reason string) error {
 	}
 
 	// Decrement connection counters
-	onlineCount.Add(-1)
+	decrementOnlineCount()
 	cp := GetControlPanel()
 	cp.DecrementConnectionCount(proxyAddr)
 

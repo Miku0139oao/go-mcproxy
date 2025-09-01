@@ -13,7 +13,7 @@ import (
 func handleForward(reader io.Reader, writer io.Writer, fml bool, protocol int, cfg config.ProxyConfig) error {
 	// Increment global connection count
 	onlineCount.Add(1)
-	defer onlineCount.Add(-1)
+	defer decrementOnlineCount()
 
 	// Increment per-proxy connection count
 	cp := GetControlPanel()

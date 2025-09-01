@@ -166,7 +166,17 @@ func (cp *ControlPanel) DecrementConnectionCount(listenAddr string) {
 	defer cp.mutex.RUnlock()
 
 	if stats, exists := cp.Stats[listenAddr]; exists {
-		stats.ConnectionCount.Add(-1)
+		// Prevent negative values
+		for {
+			cur := stats.ConnectionCount.Load()
+			if cur <= 0 {
+				// Already zero, do not decrement further
+				return
+			}
+			if stats.ConnectionCount.CompareAndSwap(cur, cur-1) {
+				return
+			}
+		}
 	}
 }
 
