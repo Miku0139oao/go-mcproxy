@@ -4,3 +4,4 @@ __debug_bin
 socks5.txt
 mcproxy.exe
 ./build
+node_modules

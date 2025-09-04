@@ -537,8 +537,21 @@ func StartControlPanel(addr string) {
 	http.HandleFunc("/auth", handleAuth)
 	http.HandleFunc("/logout", handleLogout)
 
-	// Web UI routes with authentication
-	http.HandleFunc("/", sessionAuth(handleIndex))
+	// Detect if a separated Vite build exists
+	distPath := "web\\dist"
+	if _, err := os.Stat(distPath); err == nil {
+		viteFS := http.FileServer(http.Dir(distPath))
+		// Serve static assets behind session auth
+		http.HandleFunc("/", sessionAuth(func(w http.ResponseWriter, r *http.Request) {
+			// Always serve the Vite app; FileServer will handle index.html and assets
+			viteFS.ServeHTTP(w, r)
+		}))
+	} else {
+		// Fallback to legacy server-side rendered UI
+		http.HandleFunc("/", sessionAuth(handleIndex))
+	}
+
+	// Config update and reload (still require auth)
 	http.HandleFunc("/update", sessionAuth(handleUpdate))
 	http.HandleFunc("/reload", sessionAuth(handleReload))
 
@@ -1853,19 +1866,33 @@ func handleAPIStats(w http.ResponseWriter, r *http.Request) {
 	cp := GetControlPanel()
 	cp.mutex.RLock()
 	items := make([]StatItem, 0, len(cp.Stats))
+	var total int32
 	for listen, st := range cp.Stats {
+		c := st.ConnectionCount.Load()
 		item := StatItem{
 			Listen:      listen,
 			PublicIP:    st.PublicIP,
-			Connections: st.ConnectionCount.Load(),
+			Connections: c,
 			Description: st.Config.Description,
 			Remote:      st.Config.Remote,
 		}
+		total += c
 		items = append(items, item)
 	}
+	limit := cp.ConnectionLimit
 	cp.mutex.RUnlock()
 
-	data, err := json.Marshal(items)
+	response := struct {
+		TotalConnections int32      `json:"total_connections"`
+		ConnectionLimit  int        `json:"connection_limit"`
+		Proxies          []StatItem `json:"proxies"`
+	}{
+		TotalConnections: total,
+		ConnectionLimit:  limit,
+		Proxies:          items,
+	}
+
+	data, err := json.Marshal(response)
 	if err != nil {
 		http.Error(w, "Failed to marshal stats: "+err.Error(), http.StatusInternalServerError)
 		return
