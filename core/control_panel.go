@@ -230,7 +230,8 @@ func (cp *ControlPanel) ReloadConfig() error {
 	for _, proxy := range cp.CurrentConfig.Proxies {
 		listenAddr := proxy.Listen
 		cp.Stats[listenAddr] = &ProxyStats{
-			Config: proxy,
+			Config:   proxy,
+			PublicIP: GetPublicIP(proxy.LocalAddr),
 		}
 	}
 
@@ -550,6 +551,38 @@ func StartControlPanel(addr string) {
 	http.HandleFunc("/api/recent-logs", sessionAuth(handleAPIRecentLogs))
 	http.HandleFunc("/api/delete-logs", sessionAuth(handleAPIDeleteLogs))
 
+	// API route for stats (including real-time Public IP)
+	http.HandleFunc("/api/stats", sessionAuth(handleAPIStats))
+
+	// Start background refresher for Public IPs
+	go func() {
+		for {
+			cp := GetControlPanel()
+			// Snapshot proxies to avoid holding lock during network calls
+			cp.mutex.RLock()
+			proxies := make([]config.ProxyConfig, len(cp.CurrentConfig.Proxies))
+			copy(proxies, cp.CurrentConfig.Proxies)
+			cp.mutex.RUnlock()
+
+			for _, proxy := range proxies {
+				listenAddr := proxy.Listen
+				// Compute without holding lock
+				pub := GetPublicIP(proxy.LocalAddr)
+				// Update stats safely
+				cp.mutex.Lock()
+				stats, ok := cp.Stats[listenAddr]
+				if !ok {
+					stats = &ProxyStats{Config: proxy}
+					cp.Stats[listenAddr] = stats
+				}
+				stats.PublicIP = pub
+				cp.mutex.Unlock()
+			}
+
+			time.Sleep(60 * time.Second)
+		}
+	}()
+
 	log.Printf("[INFO] Control panel listening on %s", addr)
 	go func() {
 		err := http.ListenAndServe(addr, nil)
@@ -856,8 +889,8 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                     <tr>
                         <td>{{$addr}}</td>
                         <td>{{$stats.Config.Description}}</td>
-                        <td>{{$stats.Config.Remote}}</td>
-                        <td>{{$stats.PublicIP}}</td>
+                      		<td>{{$stats.Config.Remote}}</td>
+						<td class="public-ip" data-listen="{{$addr}}">{{$stats.PublicIP}}</td>
                         <td>
                             {{if lt $stats.ConnectionCount.Load 1}}
                                 <span class="status-indicator status-good" title="Idle"></span>Idle
@@ -1507,6 +1540,33 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
                 refreshLogs();
             }
         }, 30000);
+
+        // Real-time update for Public IPs in the Status tab
+        function refreshStats() {
+            fetch('/api/stats')
+                .then(resp => resp.json())
+                .then(items => {
+                    items.forEach(item => {
+                        const selector = 'td.public-ip[data-listen="' + item.listen.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&') + '"]';
+                        const cell = document.querySelector(selector);
+                        if (cell && cell.textContent !== item.public_ip) {
+                            cell.textContent = item.public_ip;
+                        }
+                    });
+                })
+                .catch(err => console.error('Failed to refresh stats:', err));
+        }
+
+        // Auto-refresh Public IPs every 10 seconds when Status tab is active
+        setInterval(() => {
+            const statusTab = document.getElementById('status');
+            if (statusTab.className.includes('active-tabcontent')) {
+                refreshStats();
+            }
+        }, 10000);
+
+        // Initial fetch shortly after load
+        setTimeout(refreshStats, 2000);
     </script>
 </body>
 </html>
@@ -1770,7 +1830,47 @@ func handleAPIDisconnect(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	// Return success response
-	w.Write([]byte(`{"success": true}`))
+ w.Write([]byte(`{"success": true}`))
+}
+
+// handleAPIStats returns current stats including Public IP for each listen address
+func handleAPIStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	type StatItem struct {
+		Listen       string `json:"listen"`
+		PublicIP     string `json:"public_ip"`
+		Connections  int32  `json:"connections"`
+		Description  string `json:"description"`
+		Remote       string `json:"remote"`
+	}
+
+	cp := GetControlPanel()
+	cp.mutex.RLock()
+	items := make([]StatItem, 0, len(cp.Stats))
+	for listen, st := range cp.Stats {
+		item := StatItem{
+			Listen:      listen,
+			PublicIP:    st.PublicIP,
+			Connections: st.ConnectionCount.Load(),
+			Description: st.Config.Description,
+			Remote:      st.Config.Remote,
+		}
+		items = append(items, item)
+	}
+	cp.mutex.RUnlock()
+
+	data, err := json.Marshal(items)
+	if err != nil {
+		http.Error(w, "Failed to marshal stats: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Write(data)
 }
 
 // handleAPILogs returns a JSON list of logs with optional filtering
